@@ -1,0 +1,133 @@
+---
+title: "Practical Machine Learning Course Project"
+author: "Dylan Beeber"
+date: "2026-01-07"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(caret)
+library(doParallel)
+```
+
+In this project, our goal is to create a model that will predict the class of an exercise related to the manner in which the exercise is being performed. We will be ingesting and cleaning the data, discussing our model, and then using the model to predict 20 different cases in a quiz data set.
+
+```{r}
+# Load in data
+pml_data <- read.csv("~/pml-training.csv")
+quiz_set <- read.csv("~/pml-testing.csv")
+
+# Set seed
+set.seed(123)
+```
+
+### Data Cleaning
+
+As a note about the data cleaning step, the summary website that contains details regarding the variables in this data set appears to be down, which means that I will have to treat this data set very naively. I wish more information was available on this data set, because it seems reasonable to ask the question of whether to treat this as a time series (as in multiple time points are assigned to a single repetition of the exercise, and the class should be assigned per repetition). But without more information, I will be treating each row as an independent event to predict class on. This seems to be in line with the way that the data is presented in the quiz set.
+
+The quiz data set lacks several variables found in the training data set, so we will be removing these variables immediately, as they will not help us predict the quiz problems. In addition, we will be removing columns with NA values. Finally, we will remove any metadata columns containing information that will not help us to predict the class and split the remaining data in to a training and test data set.
+
+```{r}
+# Data cleaning
+
+# Remove columns not found in the quiz set data
+quiz_cols <- colnames(quiz_set)
+quiz_cols <- quiz_cols[!(quiz_cols %in% "problem_id")]
+cleaned_data <- pml_data[, quiz_cols]
+
+# Remove columns with NA in the testing set
+check_na <- function(column, dataframe) {
+  if (any(is.na(dataframe[[column]]))) {
+    return(FALSE)
+  } else {
+    return(TRUE)
+  }
+}
+
+# Keep only columns without NAs in the testing data
+cols_to_keep <- quiz_cols[sapply(quiz_cols, check_na, quiz_set)]
+cleaned_data <- cleaned_data[ , cols_to_keep]
+# Add back in classe column
+cleaned_data$classe <- pml_data$classe
+
+# Remove metadata columns
+metadata_cols <- c("X", "user_name", "raw_timestamp_part_1", "raw_timestamp_part_2", "cvtd_timestamp", "new_window", "num_window")
+cleaned_data <- cleaned_data[, !(colnames(cleaned_data) %in% metadata_cols)]
+
+# Treat classe as a factor
+cleaned_data$classe <- factor(cleaned_data$classe)
+
+# Partition data
+inTrain = createDataPartition(cleaned_data$classe, p = 3/4)[[1]]
+training <- cleaned_data[inTrain,]
+testing <- cleaned_data[-inTrain,]
+```
+
+### Creating the Model
+
+I will be using a random forest method to create this model, as random forests generally work well for classification problems without also needing extensive tuning and without making many assumptions about the data set. Training random forests can be parallelized reasonably well, and I am in an environment where I can take advantage of this parallelization. Some experimentation was done with other model types, but random forests appeared to work the best out of the box.
+
+Repeated cross-validation is used when generating this model, splitting the training set up into 5 chunks, training models on each of those splits, and then repeating this process 3 times to get a robust estimation of the accuracy. I am also setting the tuneLength parameter in my train function to 5 in order to test out multiple different mtry values and pick the best one in the final model. Using this strategy, an mtry value of 14 was automatically chosen for the final model.
+
+```{r, cache=TRUE}
+set.seed(123)
+
+ctrl <- trainControl(method = "repeatedcv", number = 5, repeats = 3, savePredictions = "final")
+
+# Set up parallel processing
+cl <- makeCluster(32)
+registerDoParallel(cl)
+
+# Create model
+modelFit <- train(classe ~ .,
+                  method = "rf",
+                  trControl = ctrl,
+                  tuneLength = 5,
+                  data = training,
+                  importance = TRUE)
+
+# Stop parallel processing
+suppressWarnings(stopCluster(cl))
+registerDoSEQ()
+
+# Summary of modelFit 
+print(modelFit)
+```
+
+### Results
+
+The following plot displays the accuracy at different mtry values, again we can see that the accuracy is highest at an mtry value of 14. Additional tuning could be performed on this parameter, but the accuracy is already quite high and may not be necessary for this project.
+
+```{r}
+plot(modelFit)
+```
+
+Next, we display a plot of our variable importance, indicating which variables were most important to overall predictions (mean of importance for each class) and predictions for each class. We have subset to only include the top 10 overall most important variables by mean importance.
+
+```{r}
+# Get variable importance
+vi <- varImp(modelFit)
+# Calculate mean importance and subset to top 10 most important variables (by mean)
+vi$importance$overall <- rowMeans(vi$importance[ , c("A", "B", "C", "D", "E"), drop = FALSE])
+vi$importance <- vi$importance[order(-vi$importance$overall), , drop = FALSE]
+vi$importance <- head(vi$importance, 10)
+
+plot(vi)
+```
+
+When using the model to predict on the testing set that was held out from the training process and cross validation, we see that **we achieve a 99.5% accuracy on the test set**. This allows us to estimate that **our out of sample error is 0.5%**. 
+
+```{r}
+# Predict on test data set
+predictions <- predict(modelFit, newdata = testing)
+confusionMatrix(predictions, testing$classe)
+```
+
+Finally, we will use the model to predict on the quiz set
+
+```{r}
+quiz_predictions <- predict(modelFit, newdata = quiz_set)
+quiz_predictions
+```
+
+
